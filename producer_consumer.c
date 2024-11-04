@@ -13,9 +13,9 @@ MODULE_AUTHOR("Your Name");
 MODULE_DESCRIPTION("Zombie Killer Kernel Module");
 
 // Module parameters
-static int prod = 1; // Number of producer threads
-static int cons = 5; // Number of consumer threads
-static int size = 10; // Size of the buffer
+static int prod = 1;   // Number of producer threads
+static int cons = 5;   // Number of consumer threads
+static int size = 10;  // Size of the buffer
 static int uid = 1000; // User ID for filtering zombie processes
 
 module_param(prod, int, 0);
@@ -44,33 +44,35 @@ static int *consumer_ids[10]; // Array to store dynamically allocated IDs
 // Producer thread function
 static int producer_thread(void *data) {
     struct task_struct *task;
-
     while (!kthread_should_stop()) {
         mutex_lock(&buffer_mutex);
-
         for_each_process(task) {
+            if (kthread_should_stop()) {
+                printk(KERN_INFO "[Producer] kthread_should_stop detected. Exiting producer thread.\n");
+                return 0;
+            }
             if (task->exit_state == EXIT_ZOMBIE && task->cred->uid.val == uid) {
                 while (count == BUFFER_SIZE) {
                     mutex_unlock(&buffer_mutex);
                     if (wait_event_interruptible(buffer_not_full, count < BUFFER_SIZE || kthread_should_stop())) {
-                        return 0; // Exit if interrupted
+                        return 0;
+                    }
+                    if (kthread_should_stop()) {
+                        printk(KERN_INFO "[Producer] kthread_should_stop detected. Exiting producer thread.\n");
+                        return 0;
                     }
                     mutex_lock(&buffer_mutex);
                 }
-
                 buffer[in] = task;
                 in = (in + 1) % BUFFER_SIZE;
                 count++;
-
                 printk(KERN_INFO "[Producer] Produced zombie process with pid %d\n", task->pid);
                 wake_up_interruptible(&buffer_not_empty);
             }
         }
-
         mutex_unlock(&buffer_mutex);
-        msleep(250); // Sleep to avoid busy-waiting
+        msleep(250);
     }
-
     return 0;
 }
 
@@ -81,13 +83,21 @@ static int consumer_thread(void *data) {
 
     while (!kthread_should_stop()) {
         mutex_lock(&buffer_mutex);
-
         while (count == 0) {
             mutex_unlock(&buffer_mutex);
             if (wait_event_interruptible(buffer_not_empty, count > 0 || kthread_should_stop())) {
                 return 0; // Exit if interrupted
             }
+            if (kthread_should_stop()) {
+                printk(KERN_INFO "[Consumer-%d] kthread_should_stop detected during wait. Exiting consumer thread.\n", consumer_id);
+                return 0;
+            }
             mutex_lock(&buffer_mutex);
+        }
+        if (kthread_should_stop()) {
+            mutex_unlock(&buffer_mutex);
+            printk(KERN_INFO "[Consumer-%d] kthread_should_stop detected. Exiting consumer thread.\n", consumer_id);
+            return 0;
         }
 
         zombie = buffer[out];
@@ -97,12 +107,13 @@ static int consumer_thread(void *data) {
         printk(KERN_INFO "[Consumer-%d] Consumed zombie process with pid %d\n", consumer_id, zombie->pid);
 
         // Kill the parent of the zombie process
-        kill_pid(task_pid(zombie->parent), SIGKILL, 0);
+        if (zombie->parent) {
+            kill_pid(task_pid(zombie->parent), SIGKILL, 0);
+        }
 
         wake_up_interruptible(&buffer_not_full);
         mutex_unlock(&buffer_mutex);
     }
-
     return 0;
 }
 
@@ -111,6 +122,11 @@ static int __init zombie_killer_init(void) {
     int i;
 
     producer = kthread_run(producer_thread, NULL, "producer_thread");
+    if (IS_ERR(producer)){
+        printk(KERN_ERR "Failed to create producer thread\n");
+        return PTR_ERR(producer);
+    }
+    printk(KERN_ALERT "Producer Thread created successfully.\n");
 
     for (i = 0; i < cons; i++) {
         consumer_ids[i] = kmalloc(sizeof(int), GFP_KERNEL);
@@ -126,13 +142,8 @@ static void __exit zombie_killer_exit(void) {
     int i;
 
     printk(KERN_INFO "Zombie Killer Module: Starting exit cleanup...\n");
-
-    // Stop the producer thread
-    if (producer) {
-        printk(KERN_INFO "Stopping producer thread...\n");
-        kthread_stop(producer);
-        printk(KERN_INFO "Producer thread stopped.\n");
-    }
+    wake_up_interruptible_all(&buffer_not_empty);
+    wake_up_interruptible_all(&buffer_not_full);
 
     // Stop each consumer thread and free associated memory
     for (i = 0; i < cons; i++) {
@@ -145,6 +156,12 @@ static void __exit zombie_killer_exit(void) {
             kfree(consumer_ids[i]);
             printk(KERN_INFO "Freed memory for consumer thread ID %d.\n", i);
         }
+    }
+
+    if (producer) {
+        printk(KERN_INFO "Stopping producer thread ...\n");
+        kthread_stop(producer);
+        printk(KERN_INFO "Producer Thread Stopped ...\n");
     }
 
     printk(KERN_INFO "Zombie Killer Module Unloaded\n");
